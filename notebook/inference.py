@@ -103,6 +103,7 @@ class Inference:
         self,
         image: Union[Image.Image, np.ndarray, str, os.PathLike, List],
         mask: Optional[Union[None, Image.Image, np.ndarray]] = None,
+        aux_views: Optional[Union[str, os.PathLike, List]] = None,
         seed: Optional[int] = None,
         pointmap=None,
     ) -> dict:
@@ -143,7 +144,8 @@ class Inference:
         return self._pipeline.run(
             image_input,
             mask_input,
-            seed,
+            aux_views=aux_views,
+            seed=seed,
             stage1_only=False,
             with_mesh_postprocess=False,
             with_texture_baking=False,

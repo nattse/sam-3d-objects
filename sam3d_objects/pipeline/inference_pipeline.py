@@ -534,6 +534,7 @@ class InferencePipeline:
         self,
         image: Union[None, Image.Image, np.ndarray, str, Path, Sequence],
         mask: Union[None, Image.Image, np.ndarray] = None,
+        aux_views: Union[None, str, Path, Sequence] = None,
         seed=42,
         stage1_only=False,
         with_mesh_postprocess=True,
@@ -548,6 +549,8 @@ class InferencePipeline:
         """
         Parameters:
         - image (Image): The input image to be processed.
+        - aux_views (Union[Path, Sequence], optional): Optional directory or list of auxiliary
+          views used for multi-view conditioning.
         - seed (int, optional): The random seed for reproducibility. Default is 42.
         - stage1_only (bool, optional): If True, only the sparse structure is sampled and returned. Default is False.
         - with_mesh_postprocess (bool, optional): If True, performs mesh post-processing. Default is True.
@@ -555,7 +558,7 @@ class InferencePipeline:
         Returns:
         - dict: A dictionary containing the GLB file and additional data from the sparse structure sampling.
         """
-        primary_image, aux_images = self._prepare_image_inputs(image, mask)
+        primary_image, aux_images = self._prepare_image_inputs(image, mask, aux_views)
         with self.device:
             ss_input_dict = self.preprocess_image(primary_image, self.ss_preprocessor)
             slat_input_dict = self.preprocess_image(primary_image, self.slat_preprocessor)
@@ -694,32 +697,85 @@ class InferencePipeline:
             raise ValueError(f"No supported images found in directory: {directory}")
         return images
 
+    def _gather_auxiliary_views(
+        self, aux_views: Union[None, str, Path, Sequence]
+    ) -> List[np.ndarray]:
+        if aux_views is None:
+            return []
+
+        if isinstance(aux_views, (str, Path)):
+            aux_path = Path(aux_views)
+            if aux_path.is_dir():
+                return [np.array(img) for img in self._load_images_from_directory(aux_path)]
+            if aux_path.is_file():
+                return [self._to_rgba_array(aux_path)]
+            raise ValueError(f"Auxiliary view path does not exist: {aux_path}")
+
+        if isinstance(aux_views, Sequence) and not isinstance(
+            aux_views, (np.ndarray, Image.Image)
+        ):
+            aux_list = list(aux_views)
+            if not aux_list:
+                raise ValueError("Auxiliary view sequence cannot be empty")
+            return [self._to_rgba_array(img) for img in aux_list]
+
+        raise TypeError(
+            "Auxiliary views must be a directory, path to an image, or a sequence of image arrays/paths"
+        )
+
     def _prepare_image_inputs(
         self,
         image: Union[None, Image.Image, np.ndarray, str, Path, Sequence],
         mask: Union[None, Image.Image, np.ndarray],
+        aux_views: Union[None, str, Path, Sequence],
     ) -> Tuple[np.ndarray, List[np.ndarray]]:
         if image is None:
             raise ValueError("Image input cannot be None")
 
         aux_images: List[np.ndarray] = []
 
-        if isinstance(image, (str, Path)):
-            image_path = Path(image)
-            if image_path.is_dir():
-                loaded_images = self._load_images_from_directory(image_path)
-                primary = loaded_images[0]
-                aux_images = [np.array(img) for img in loaded_images[1:]]
+        if aux_views is not None and isinstance(image, (str, Path)) and Path(image).is_dir():
+            raise ValueError(
+                "Provide the primary image file separately when supplying auxiliary views via aux_views."
+            )
+
+        if aux_views is None:
+            if isinstance(image, (str, Path)):
+                image_path = Path(image)
+                if image_path.is_dir():
+                    loaded_images = self._load_images_from_directory(image_path)
+                    primary = loaded_images[0]
+                    aux_images = [np.array(img) for img in loaded_images[1:]]
+                else:
+                    primary = self._to_rgba_array(image_path)
+            elif isinstance(image, Sequence) and not isinstance(
+                image, (np.ndarray, Image.Image)
+            ):
+                image_list = list(image)
+                if not image_list:
+                    raise ValueError("Image sequence cannot be empty")
+                primary = self._to_rgba_array(image_list[0])
+                aux_images = [self._to_rgba_array(img) for img in image_list[1:]]
             else:
-                primary = self._to_rgba_array(image_path)
-        elif isinstance(image, Sequence) and not isinstance(image, (np.ndarray, Image.Image)):
-            image_list = list(image)
-            if not image_list:
-                raise ValueError("Image sequence cannot be empty")
-            primary = self._to_rgba_array(image_list[0])
-            aux_images = [self._to_rgba_array(img) for img in image_list[1:]]
+                primary = image
         else:
-            primary = image
+            if isinstance(image, Sequence) and not isinstance(
+                image, (np.ndarray, Image.Image)
+            ):
+                image_list = list(image)
+                if not image_list:
+                    raise ValueError("Image sequence cannot be empty")
+                primary = self._to_rgba_array(image_list[0])
+                if len(image_list) > 1:
+                    raise ValueError(
+                        "When providing aux_views, pass a single primary image instead of a list."
+                    )
+            elif isinstance(image, (str, Path)):
+                primary = self._to_rgba_array(image)
+            else:
+                primary = image
+
+            aux_images = self._gather_auxiliary_views(aux_views)
 
         primary_rgba = self.merge_image_and_mask(primary, mask)
         aux_images = [self._ensure_rgba_array(img) for img in aux_images]
