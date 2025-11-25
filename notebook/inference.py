@@ -6,6 +6,8 @@ os.environ["CUDA_HOME"] = os.environ["CONDA_PREFIX"]
 os.environ["LIDRA_SKIP_INIT"] = "true"
 
 import sys
+import inspect
+import warnings
 from pathlib import Path
 from typing import Union, Optional, List, Callable
 import numpy as np
@@ -91,6 +93,9 @@ class Inference:
         config.workspace_dir = os.path.dirname(config_file)
         check_hydra_safety(config, WHITELIST_FILTERS, BLACKLIST_FILTERS)
         self._pipeline: InferencePipelinePointMap = instantiate(config)
+        self._pipeline_supports_aux_views = (
+            "aux_views" in inspect.signature(self._pipeline.run).parameters
+        )
 
     def merge_mask_to_rgba(self, image, mask):
         mask = mask.astype(np.uint8) * 255
@@ -141,10 +146,20 @@ class Inference:
             else:
                 raise ValueError("Unsupported image type for masking.")
 
+        if aux_views is not None and not self._pipeline_supports_aux_views:
+            warnings.warn(
+                "Loaded pipeline does not expose 'aux_views'; update your checkpoints "
+                "or pipeline YAML to a version that supports auxiliary view conditioning."
+            )
+
         return self._pipeline.run(
             image_input,
             mask_input,
-            aux_views=aux_views,
+            **(
+                {"aux_views": aux_views}
+                if self._pipeline_supports_aux_views
+                else {}
+            ),
             seed=seed,
             stage1_only=False,
             with_mesh_postprocess=False,
