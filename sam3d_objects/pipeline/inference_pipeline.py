@@ -20,7 +20,8 @@ def set_attention_backend():
 
 set_attention_backend()
 
-from typing import List, Union
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple, Union
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 import numpy as np
@@ -46,6 +47,65 @@ from sam3d_objects.model.io import (
 from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp
 from sam3d_objects.model.backbone.tdfy_dit.utils import postprocessing_utils
 from safetensors.torch import load_file
+
+
+class MultiViewConditionAdapter(torch.nn.Module):
+    """Wrap a condition embedder to concatenate tokens from auxiliary views.
+
+    The primary view is passed positionally. Additional views are provided via
+    aux_* keyword arguments and are embedded individually with the same
+    underlying model, then concatenated along the token dimension.
+    """
+
+    def __init__(self, base_embedder: torch.nn.Module):
+        super().__init__()
+        self.base_embedder = base_embedder
+
+    def forward(
+        self,
+        image,
+        *args,
+        aux_image: Optional[torch.Tensor] = None,
+        aux_mask: Optional[torch.Tensor] = None,
+        aux_rgb_image: Optional[torch.Tensor] = None,
+        aux_rgb_image_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        aux_image = kwargs.pop("aux_image", aux_image)
+        aux_mask = kwargs.pop("aux_mask", aux_mask)
+        aux_rgb_image = kwargs.pop("aux_rgb_image", aux_rgb_image)
+        aux_rgb_image_mask = kwargs.pop("aux_rgb_image_mask", aux_rgb_image_mask)
+
+        base_kwargs = dict(kwargs)
+        tokens = self.base_embedder(image, *args, **base_kwargs)
+
+        if aux_image is None:
+            return tokens
+
+        if aux_image.ndim == 3:
+            aux_image = aux_image[None]
+
+        aux_tokens = []
+        for idx in range(aux_image.shape[0]):
+            aux_kwargs = dict(base_kwargs)
+            if aux_mask is not None:
+                aux_kwargs["mask"] = aux_mask[idx : idx + 1]
+            if aux_rgb_image is not None:
+                aux_kwargs["rgb_image"] = aux_rgb_image[idx : idx + 1]
+            if aux_rgb_image_mask is not None:
+                aux_kwargs["rgb_image_mask"] = aux_rgb_image_mask[idx : idx + 1]
+
+            aux_tokens.append(
+                self.base_embedder(
+                    aux_image[idx : idx + 1], *args, **aux_kwargs
+                )
+            )
+
+        if aux_tokens:
+            combined_aux = torch.cat(aux_tokens, dim=1)
+            tokens = torch.cat([tokens, combined_aux], dim=1)
+
+        return tokens
 
 
 class InferencePipeline:
@@ -164,6 +224,12 @@ class InferencePipeline:
                 "ss_condition_embedder": ss_condition_embedder,
                 "slat_condition_embedder": slat_condition_embedder,
             }
+
+            for key, embedder in self.condition_embedders.items():
+                if embedder is not None:
+                    self.condition_embedders[key] = MultiViewConditionAdapter(
+                        embedder
+                    )
 
             # override generator and condition embedder setting
             self.override_ss_generator_cfg_config(
@@ -466,8 +532,9 @@ class InferencePipeline:
 
     def run(
         self,
-        image: Union[None, Image.Image, np.ndarray],
+        image: Union[None, Image.Image, np.ndarray, str, Path, Sequence],
         mask: Union[None, Image.Image, np.ndarray] = None,
+        aux_views: Union[None, str, Path, Sequence] = None,
         seed=42,
         stage1_only=False,
         with_mesh_postprocess=True,
@@ -482,6 +549,8 @@ class InferencePipeline:
         """
         Parameters:
         - image (Image): The input image to be processed.
+        - aux_views (Union[Path, Sequence], optional): Optional directory or list of auxiliary
+          views used for multi-view conditioning.
         - seed (int, optional): The random seed for reproducibility. Default is 42.
         - stage1_only (bool, optional): If True, only the sparse structure is sampled and returned. Default is False.
         - with_mesh_postprocess (bool, optional): If True, performs mesh post-processing. Default is True.
@@ -489,11 +558,21 @@ class InferencePipeline:
         Returns:
         - dict: A dictionary containing the GLB file and additional data from the sparse structure sampling.
         """
-        # This should only happen if called from demo
-        image = self.merge_image_and_mask(image, mask)
+        primary_image, aux_images = self._prepare_image_inputs(image, mask, aux_views)
         with self.device:
-            ss_input_dict = self.preprocess_image(image, self.ss_preprocessor)
-            slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+            ss_input_dict = self.preprocess_image(primary_image, self.ss_preprocessor)
+            slat_input_dict = self.preprocess_image(primary_image, self.slat_preprocessor)
+            ss_aux_inputs = self._preprocess_auxiliary_images(
+                aux_images, self.ss_preprocessor
+            )
+            slat_aux_inputs = self._preprocess_auxiliary_images(
+                aux_images, self.slat_preprocessor
+            )
+
+            if ss_aux_inputs is not None:
+                ss_input_dict.update(ss_aux_inputs)
+            if slat_aux_inputs is not None:
+                slat_input_dict.update(slat_aux_inputs)
             torch.manual_seed(seed)
             ss_return_dict = self.sample_sparse_structure(
                 ss_input_dict,
@@ -568,9 +647,12 @@ class InferencePipeline:
 
     def merge_image_and_mask(
         self,
-        image: Union[np.ndarray, Image.Image],
+        image: Union[np.ndarray, Image.Image, str, Path],
         mask: Union[None, np.ndarray, Image.Image],
     ):
+        if isinstance(image, (str, Path)):
+            image = Image.open(image).convert("RGBA")
+
         if mask is not None:
             if isinstance(image, Image.Image):
                 image = np.array(image)
@@ -583,8 +665,144 @@ class InferencePipeline:
             assert mask.shape[:2] == image.shape[:2]
             image = np.concatenate([image[..., :3], mask], axis=-1)
 
-        image = np.array(image)
+        image = self._ensure_rgba_array(np.array(image))
         return image
+
+    def _to_rgba_array(self, image: Union[np.ndarray, Image.Image, str, Path]) -> np.ndarray:
+        if isinstance(image, np.ndarray):
+            return self._ensure_rgba_array(image)
+        if isinstance(image, Image.Image):
+            return np.array(image.convert("RGBA"))
+        if isinstance(image, (str, Path)):
+            return np.array(Image.open(image).convert("RGBA"))
+        raise TypeError(f"Unsupported image type: {type(image)!r}")
+
+    def _ensure_rgba_array(self, image: np.ndarray) -> np.ndarray:
+        if image.ndim == 2:
+            image = np.stack([image] * 3, axis=-1)
+        if image.shape[-1] == 3:
+            alpha = np.full_like(image[..., :1], 255, dtype=image.dtype)
+            image = np.concatenate([image, alpha], axis=-1)
+        if image.dtype != np.uint8:
+            image = image.astype(np.uint8)
+        return image
+
+    def _load_images_from_directory(self, directory: Path) -> List[Image.Image]:
+        supported_ext = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
+        images = []
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and path.suffix.lower() in supported_ext:
+                images.append(Image.open(path).convert("RGBA"))
+        if not images:
+            raise ValueError(f"No supported images found in directory: {directory}")
+        return images
+
+    def _gather_auxiliary_views(
+        self, aux_views: Union[None, str, Path, Sequence]
+    ) -> List[np.ndarray]:
+        if aux_views is None:
+            return []
+
+        if isinstance(aux_views, (str, Path)):
+            aux_path = Path(aux_views)
+            if aux_path.is_dir():
+                return [np.array(img) for img in self._load_images_from_directory(aux_path)]
+            if aux_path.is_file():
+                return [self._to_rgba_array(aux_path)]
+            raise ValueError(f"Auxiliary view path does not exist: {aux_path}")
+
+        if isinstance(aux_views, Sequence) and not isinstance(
+            aux_views, (np.ndarray, Image.Image)
+        ):
+            aux_list = list(aux_views)
+            if not aux_list:
+                raise ValueError("Auxiliary view sequence cannot be empty")
+            return [self._to_rgba_array(img) for img in aux_list]
+
+        raise TypeError(
+            "Auxiliary views must be a directory, path to an image, or a sequence of image arrays/paths"
+        )
+
+    def _prepare_image_inputs(
+        self,
+        image: Union[None, Image.Image, np.ndarray, str, Path, Sequence],
+        mask: Union[None, Image.Image, np.ndarray],
+        aux_views: Union[None, str, Path, Sequence],
+    ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        if image is None:
+            raise ValueError("Image input cannot be None")
+
+        aux_images: List[np.ndarray] = []
+
+        if aux_views is not None and isinstance(image, (str, Path)) and Path(image).is_dir():
+            raise ValueError(
+                "Provide the primary image file separately when supplying auxiliary views via aux_views."
+            )
+
+        if aux_views is None:
+            if isinstance(image, (str, Path)):
+                image_path = Path(image)
+                if image_path.is_dir():
+                    loaded_images = self._load_images_from_directory(image_path)
+                    primary = loaded_images[0]
+                    aux_images = [np.array(img) for img in loaded_images[1:]]
+                else:
+                    primary = self._to_rgba_array(image_path)
+            elif isinstance(image, Sequence) and not isinstance(
+                image, (np.ndarray, Image.Image)
+            ):
+                image_list = list(image)
+                if not image_list:
+                    raise ValueError("Image sequence cannot be empty")
+                primary = self._to_rgba_array(image_list[0])
+                aux_images = [self._to_rgba_array(img) for img in image_list[1:]]
+            else:
+                primary = image
+        else:
+            if isinstance(image, Sequence) and not isinstance(
+                image, (np.ndarray, Image.Image)
+            ):
+                image_list = list(image)
+                if not image_list:
+                    raise ValueError("Image sequence cannot be empty")
+                primary = self._to_rgba_array(image_list[0])
+                if len(image_list) > 1:
+                    raise ValueError(
+                        "When providing aux_views, pass a single primary image instead of a list."
+                    )
+            elif isinstance(image, (str, Path)):
+                primary = self._to_rgba_array(image)
+            else:
+                primary = image
+
+            aux_images = self._gather_auxiliary_views(aux_views)
+
+        primary_rgba = self.merge_image_and_mask(primary, mask)
+        aux_images = [self._ensure_rgba_array(img) for img in aux_images]
+        return primary_rgba, aux_images
+
+    def _preprocess_auxiliary_images(self, images: List[np.ndarray], preprocessor):
+        if not images:
+            return None
+
+        processed_images = []
+        processed_masks = []
+        processed_rgb_images = []
+        processed_rgb_image_masks = []
+
+        for img in images:
+            processed = self.preprocess_image(img, preprocessor)
+            processed_images.append(processed["image"])
+            processed_masks.append(processed["mask"])
+            processed_rgb_images.append(processed["rgb_image"])
+            processed_rgb_image_masks.append(processed["rgb_image_mask"])
+
+        return {
+            "aux_image": torch.cat(processed_images, dim=0),
+            "aux_mask": torch.cat(processed_masks, dim=0),
+            "aux_rgb_image": torch.cat(processed_rgb_images, dim=0),
+            "aux_rgb_image_mask": torch.cat(processed_rgb_image_masks, dim=0),
+        }
 
     def decode_slat(
         self,
@@ -795,9 +1013,10 @@ class InferencePipeline:
         self, image: Union[Image.Image, np.ndarray], preprocessor
     ) -> torch.Tensor:
         # canonical type is numpy
-        if not isinstance(input, np.ndarray):
+        if not isinstance(image, np.ndarray):
             image = np.array(image)
 
+        image = self._ensure_rgba_array(image)
         assert image.ndim == 3  # no batch dimension as of now
         assert image.shape[-1] == 4  # rgba format
         assert image.dtype == np.uint8  # [0,255] range
