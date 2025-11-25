@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-from typing import Union, Optional
+import os
+from typing import Union, Optional, Sequence
 from copy import deepcopy
 import numpy as np
 import torch
@@ -317,6 +318,7 @@ class InferencePipelinePointMap(InferencePipeline):
         self,
         image: Union[None, Image.Image, np.ndarray],
         mask: Union[None, Image.Image, np.ndarray] = None,
+        aux_views: Union[None, str, os.PathLike, Sequence] = None,
         seed: Optional[int] = None,
         stage1_only=False,
         with_mesh_postprocess=True,
@@ -331,8 +333,8 @@ class InferencePipelinePointMap(InferencePipeline):
         decode_formats=None,
         estimate_plane=False,
     ) -> dict:
-        image = self.merge_image_and_mask(image, mask)
-        with self.device: 
+        image, aux_images = self._prepare_image_inputs(image, mask, aux_views)
+        with self.device:
             pointmap_dict = self.compute_pointmap(image, pointmap)
             pointmap = pointmap_dict["pointmap"]
             pts = type(self)._down_sample_img(pointmap)
@@ -346,6 +348,17 @@ class InferencePipelinePointMap(InferencePipeline):
             )
 
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+
+            ss_aux_inputs = self._preprocess_auxiliary_images(
+                aux_images, self.ss_preprocessor
+            )
+            slat_aux_inputs = self._preprocess_auxiliary_images(
+                aux_images, self.slat_preprocessor
+            )
+            if ss_aux_inputs is not None:
+                ss_input_dict.update(ss_aux_inputs)
+            if slat_aux_inputs is not None:
+                slat_input_dict.update(slat_aux_inputs)
             if seed is not None:
                 torch.manual_seed(seed)
             ss_return_dict = self.sample_sparse_structure(

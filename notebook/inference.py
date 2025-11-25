@@ -6,6 +6,9 @@ os.environ["CUDA_HOME"] = os.environ["CONDA_PREFIX"]
 os.environ["LIDRA_SKIP_INIT"] = "true"
 
 import sys
+import inspect
+import warnings
+from pathlib import Path
 from typing import Union, Optional, List, Callable
 import numpy as np
 from PIL import Image
@@ -90,6 +93,9 @@ class Inference:
         config.workspace_dir = os.path.dirname(config_file)
         check_hydra_safety(config, WHITELIST_FILTERS, BLACKLIST_FILTERS)
         self._pipeline: InferencePipelinePointMap = instantiate(config)
+        self._pipeline_supports_aux_views = (
+            "aux_views" in inspect.signature(self._pipeline.run).parameters
+        )
 
     def merge_mask_to_rgba(self, image, mask):
         mask = mask.astype(np.uint8) * 255
@@ -100,16 +106,61 @@ class Inference:
 
     def __call__(
         self,
-        image: Union[Image.Image, np.ndarray],
-        mask: Optional[Union[None, Image.Image, np.ndarray]],
+        image: Union[Image.Image, np.ndarray, str, os.PathLike, List],
+        mask: Optional[Union[None, Image.Image, np.ndarray]] = None,
+        aux_views: Optional[Union[str, os.PathLike, List]] = None,
         seed: Optional[int] = None,
         pointmap=None,
     ) -> dict:
-        image = self.merge_mask_to_rgba(image, mask)
+        image_input = image
+        mask_input = mask
+
+        if mask is not None:
+            if isinstance(image, (np.ndarray, Image.Image)):
+                image_input = self.merge_mask_to_rgba(image, mask)
+                mask_input = None
+            elif isinstance(image, (str, os.PathLike)):
+                image_path = Path(image)
+                if image_path.is_file():
+                    image_input = self.merge_mask_to_rgba(load_image(image_path), mask)
+                    mask_input = None
+                elif image_path.is_dir():
+                    raise ValueError(
+                        "Masking a directory input is not supported; embed alpha in the primary view instead."
+                    )
+            elif isinstance(image, (list, tuple)):
+                if not image:
+                    raise ValueError("Image sequence cannot be empty")
+                image_input = list(image)
+                first = image_input[0]
+                if isinstance(first, (np.ndarray, Image.Image)):
+                    image_input[0] = self.merge_mask_to_rgba(first, mask)
+                    mask_input = None
+                elif isinstance(first, (str, os.PathLike)) and Path(first).is_file():
+                    image_input[0] = self.merge_mask_to_rgba(load_image(first), mask)
+                    mask_input = None
+                else:
+                    raise ValueError(
+                        "Masking is supported only when the primary view is an image or file path."
+                    )
+            else:
+                raise ValueError("Unsupported image type for masking.")
+
+        if aux_views is not None and not self._pipeline_supports_aux_views:
+            warnings.warn(
+                "Loaded pipeline does not expose 'aux_views'; update your checkpoints "
+                "or pipeline YAML to a version that supports auxiliary view conditioning."
+            )
+
         return self._pipeline.run(
-            image,
-            None,
-            seed,
+            image_input,
+            mask_input,
+            **(
+                {"aux_views": aux_views}
+                if self._pipeline_supports_aux_views
+                else {}
+            ),
+            seed=seed,
             stage1_only=False,
             with_mesh_postprocess=False,
             with_texture_baking=False,
